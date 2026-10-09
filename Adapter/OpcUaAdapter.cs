@@ -1,6 +1,4 @@
 using OpcUA_Server.Adapter;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using Opc.Ua;
 using Opc.Ua.Client;
 using Opc.Ua.Configuration;
@@ -10,8 +8,7 @@ namespace OpcUA_Server.Adapter;
 
 public sealed class OpcUaAdapter(
     string address,
-    RawValueCache? rawValueCache = null,
-    ILogger<OpcUaAdapter>? logger = null) :
+    RawValueCache? rawValueCache = null) :
     IOpcUaAdapter,
     IDisposable
 {
@@ -20,14 +17,11 @@ public sealed class OpcUaAdapter(
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly HashSet<string> monitoredNodeIds = new(StringComparer.Ordinal);
     private readonly RawValueCache rawValueCache = rawValueCache ?? new RawValueCache();
-    private readonly ILogger<OpcUaAdapter> logger = logger ?? NullLogger<OpcUaAdapter>.Instance;
     private ISession? session;
     private Subscription? subscription;
     private int connectionHealthy;
     private int monitoringPublishingInterval = 1_000;
     private bool disposed;
-
-    public bool GetAll;
 
     public event Action<string, DataValue>? ValueChanged;
     public event Action<OpcUaAdapter, string>? ConnectionLost;
@@ -56,7 +50,13 @@ public sealed class OpcUaAdapter(
 
     public event Action<OpcUaAdapter, ConnectionState>? StatusChanged;
 
-    public OpcUaAdapter() : this(string.Empty, null, null) { }
+    public OpcUaAdapter() : this(string.Empty, null) { }
+
+    private void SetConnectionState(ConnectionState state)
+    {
+        ConnectionState = state;
+        StatusChanged?.Invoke(this, state);
+    }
 
     public async Task ConnectAsync()
     {
@@ -71,12 +71,12 @@ public sealed class OpcUaAdapter(
             {
                 return;
             }
-            StatusChanged?.Invoke(this, ConnectionState.Connecting);
+            SetConnectionState(ConnectionState.Connecting);
 
             if (!Uri.TryCreate(Address, UriKind.Absolute, out _))
             {
                 throw new ArgumentException(
-                    "Eine gültige OPC-UA-Serveradresse ist erforderlich.",
+                    "A valid OPC UA server address is required.",
                     nameof(Address));
             }
 
@@ -108,13 +108,13 @@ public sealed class OpcUaAdapter(
                         Telemetry,
                         CancellationToken.None)
                     ?? throw new InvalidOperationException(
-                        "Es wurde kein passender OPC-UA-Endpoint gefunden.");
+                        "No matching OPC UA endpoint was found.");
 
                 if (UseSecurity &&
                     selectedEndpoint.SecurityMode == MessageSecurityMode.None)
                 {
                     throw new InvalidOperationException(
-                        "Kein sicherer OPC-UA-Endpoint verfügbar.");
+                        "No secure OPC UA endpoint is available.");
                 }
 
                 var endpoint = new ConfiguredEndpoint(
@@ -155,7 +155,7 @@ public sealed class OpcUaAdapter(
                 }
 
                 connected = true;
-                StatusChanged?.Invoke(this, ConnectionState.Connected);
+                SetConnectionState(ConnectionState.Connected);
             }
             finally
             {
@@ -165,7 +165,7 @@ certificateHandler;
         }
         catch
         {
-            StatusChanged?.Invoke(this, ConnectionState.Disconnected);
+            SetConnectionState(ConnectionState.Disconnected);
             throw;
         }
         finally
@@ -348,7 +348,7 @@ certificateHandler;
             return;
         }
 
-        StatusChanged?.Invoke(this, ConnectionState.Reconnecting);
+        SetConnectionState(ConnectionState.Reconnecting);
 
         string message = eventArgs.Status?.ToString() ?? "Unbekannter KeepAlive-Fehler";
         ConnectionLost?.Invoke(this, message);
@@ -368,10 +368,7 @@ certificateHandler;
             }
             catch (Exception exception)
             {
-                logger.LogError(
-                    exception,
-                    "{ServerName}: Datenänderung konnte nicht verarbeitet werden",
-                    Name);
+                System.Diagnostics.Trace.TraceError($"{Name}: Could not process a value change: {exception}");
             }
         }
     }
@@ -497,7 +494,7 @@ certificateHandler;
         if (response.Results.Count != ids.Count)
         {
             throw new InvalidOperationException(
-                "Der OPC-UA-Server lieferte eine unvollständige Leseantwort.");
+                "The OPC UA server returned an incomplete read response.");
         }
 
         return [.. response.Results];
@@ -528,7 +525,7 @@ certificateHandler;
             if (response.Results.Count != 1)
             {
                 throw new InvalidOperationException(
-                    "Der OPC-UA-Server lieferte eine ungültige Schreibantwort.");
+                    "The OPC UA server returned an invalid write response.");
             }
 
             if (!StatusCode.IsGood(response.Results[0]))
@@ -549,7 +546,7 @@ certificateHandler;
         try
         {
             await CloseSessionAsync();
-            StatusChanged?.Invoke(this, ConnectionState.Disconnected);
+            SetConnectionState(ConnectionState.Disconnected);
         }
         finally
         {
@@ -597,7 +594,7 @@ certificateHandler;
             await builder.CreateAsync(CancellationToken.None);
 
         // Separate certificate stores for this independent copy.
-        string pkiRoot = Path.Combine(AppContext.BaseDirectory, "OpcUA_Server", "AdapterPki");
+        string pkiRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OpcUaAdapter", "pki", $"net{Environment.Version.Major}");
         configuration.SecurityConfiguration.ApplicationCertificate.StorePath = Path.Combine(pkiRoot, "own");
         configuration.SecurityConfiguration.TrustedPeerCertificates.StorePath = Path.Combine(pkiRoot, "trusted");
         configuration.SecurityConfiguration.TrustedIssuerCertificates.StorePath = Path.Combine(pkiRoot, "issuers");
@@ -606,7 +603,7 @@ certificateHandler;
         if (!await application.CheckApplicationInstanceCertificatesAsync(false))
         {
             throw new InvalidOperationException(
-                "Das OPC-UA-Anwendungszertifikat konnte nicht erstellt werden.");
+                "Could not create the OPC UA client certificate.");
         }
 
         return configuration;
@@ -619,7 +616,7 @@ certificateHandler;
         if (session?.Connected != true)
         {
             throw new InvalidOperationException(
-                "Der OPC-UA-Client ist nicht verbunden.");
+                "The OPC UA client is not connected.");
         }
 
         return session;
@@ -649,10 +646,7 @@ certificateHandler;
             }
             catch (Exception exception)
             {
-                logger.LogWarning(
-                    exception,
-                    "{ServerName}: Alte Subscription konnte beim Trennen nicht sauber gelöscht werden",
-                    Name);
+                System.Diagnostics.Trace.TraceError($"{Name}: Could not delete the previous subscription during disconnect: {exception}");
             }
             finally
             {
@@ -675,10 +669,7 @@ certificateHandler;
         }
         catch (Exception exception)
         {
-            logger.LogWarning(
-                exception,
-                "{ServerName}: Alte Session konnte beim Trennen nicht sauber geschlossen werden",
-                Name);
+            System.Diagnostics.Trace.TraceError($"{Name}: Could not close the previous session during disconnect: {exception}");
         }
         finally
         {

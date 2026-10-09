@@ -1,48 +1,29 @@
 # OPC UA Adapter
 
-Reusable OPC UA client source code for connecting, reading, writing and monitoring node values. This repository contains twelve C# source files and this guide. It is a source package, not a standalone application or a prebuilt DLL.
-
-The companion server and dashboard are available in [NBFinn/OpcUa-Server](https://github.com/NBFinn/OpcUa-Server). They do not compile or use this adapter.
+A direct OPC UA client source package for connection, browsing, reading, writing and subscriptions. It contains five C# files. There is no mediator, MassTransit, message bus, dependency injection container or background session manager. The companion [raw server](https://github.com/NBFinn/OpcUa-Server) is a separate application.
 
 ## Structure
 
 ```text
 Adapter/
-  OpcUaAdapter.cs                 Direct OPC UA connection
-  Abstractions/                  IOpcUaAdapter and IOpcUaSessionManager
-  Configuration/                 Adapter and connection settings
-  Connections/                   Session manager and connection state
-  Events/                        Connection and value messages
-  Values/                        Raw values and cache
-README.md                        Integration guide
+  OpcUaAdapter.cs               Direct OPC UA session and subscriptions
+  Abstractions/IOpcUaAdapter.cs Public interface
+  Connections/ConnectionState.cs
+  Values/OpcUaRawValue.cs       Raw value, timestamps and quality
+  Values/RawValueCache.cs       Latest values and ValueUpdated event
 ```
 
-All source files use `OpcUA_Server.Adapter`. Subfolders organize responsibilities; they do not introduce separate namespaces.
+The namespace is OpcUA_Server.Adapter. This remains a source package, not a standalone app or a prebuilt DLL. Copy Adapter into your own project. The folder structure stays organized; there are no project references to the original gateway.
 
-## Compatibility
+## Add to your project
 
-The source files have been built for **.NET 6, 7, 8, 9 and 10** using C# 12 and the .NET 10 SDK. Connection testing against your own server is still required.
-
-For .NET 6 and 7, current OPC UA and Microsoft dependencies emit target-framework support warnings. A successful build is not a support commitment from those package authors. These legacy targets should be evaluated against your deployment requirements.
-
-.NET Framework 4.x, .NET Core 3.1 and .NET 5 have not been configured or tested for this source package. Compatibility with a target runtime does not imply compatibility with an older compiler.
-
-## Add the adapter to your project
-
-1. Clone this repository, or download and extract it from GitHub.
-2. Copy `Adapter` into your C# project next to its `.csproj` file.
-3. Enable implicit usings and nullable reference types, and use C# 12.
-4. Add the NuGet packages below and build your project.
+Use .NET 8, 9 or 10 with C# 12, implicit usings and nullable reference types enabled. The only direct package dependency is the OPC Foundation client SDK:
 
 ```powershell
-git clone https://github.com/NBFinn/OpcUa-Adapter.git
-dotnet add YourProject.csproj package OPCFoundation.NetStandard.Opc.Ua --version 1.5.378.176
-dotnet add YourProject.csproj package Microsoft.Extensions.Logging.Abstractions --version 10.0.8
-dotnet add YourProject.csproj package MassTransit --version 8.5.10
-dotnet build YourProject.csproj
+dotnet add YourProject.csproj package OPCFoundation.NetStandard.Opc.Ua.Client --version 1.5.378.176
 ```
 
-Example project settings:
+The SDK brings its required transitive dependencies. You do not need MassTransit or Microsoft.Extensions.Logging.Abstractions as explicit dependencies of this adapter. Cleanup diagnostics use System.Diagnostics.Trace. The previous session-manager configuration, mediator messages, injected logger constructor argument and GetAll field have been removed.
 
 ```xml
 <PropertyGroup>
@@ -53,37 +34,28 @@ Example project settings:
 </PropertyGroup>
 ```
 
-Replace `net8.0` with your chosen compatible target. SDK-style projects normally include C# files automatically. If your project sets `EnableDefaultCompileItems=false`, explicitly include them:
+For projects with EnableDefaultCompileItems=false, explicitly include Adapter/**/*.cs. The source was built and tested on .NET 8, 9 and 10; older targets are no longer part of the validated package.
 
-```xml
-<ItemGroup>
-  <Compile Include="Adapter\**\*.cs" />
-</ItemGroup>
-```
+## Connect, read and write
 
-MassTransit is used by `OpcUaSessionManager` and its local mediator. It is not needed by the direct adapter class alone, but is required when compiling all twelve files. The local mediator does not require an external message broker.
-
-## First connection and read
-
-Start your OPC UA server, then try the following inside an async console application. Replace the address with the endpoint your server reports. The companion TestServer uses port `5844` and the path `/TestServerSimulator`.
+Start the server first and use the endpoint it prints. Port 5844 is only its preference: a busy port causes automatic selection of another port.
 
 ```csharp
 using OpcUA_Server.Adapter;
 
-using var adapter = new OpcUaAdapter(
-    "opc.tcp://localhost:5844/TestServerSimulator")
+using var adapter = new OpcUaAdapter("opc.tcp://localhost:5844/TestServerSimulator")
 {
-    Name = "TestServer",
+    Name = "TestClient",
     UseSecurity = false
 };
 
 try
 {
     await adapter.ConnectAsync();
-    var values = await adapter.ReadAllAsync();
-    Console.WriteLine($"Connected: {adapter.IsConnected}");
-    foreach (var value in values.Take(5))
-        Console.WriteLine($"{value.NodeId}: {value.Value} (Good: {value.IsGood})");
+    var current = await adapter.ReadAsync("ns=3;s=Test.Counter");
+    Console.WriteLine($"{current.Value}, good: {current.IsGood}");
+    await adapter.WriteAsync("ns=3;s=Test.Counter", 42);
+    var all = await adapter.ReadAllAsync();
 }
 finally
 {
@@ -91,91 +63,30 @@ finally
 }
 ```
 
-`UseSecurity=false` selects an unsecured endpoint for a local connection test. Set it to `true` for a secured endpoint and configure certificate trust on both peers. HTTP addresses such as `http://localhost:6084` are REST API addresses, not OPC UA endpoints.
+Write a correctly typed C# value: bool, int, double or string for the four test nodes. A value such as "42" is a string, not an Int32. Bad write results throw ServiceResultException. Read results expose IsGood and StatusCode; check quality before using a value. ReadAllAsync browses custom variables, excluding namespace 0 system nodes.
 
-## Read and write individual nodes
+## Monitor values
 
-After `ConnectAsync()` succeeds:
-
-```csharp
-string nodeId = "YOUR_COMPLETE_NODE_ID";
-var current = await adapter.ReadAsync(nodeId);
-Console.WriteLine(current.Value);
-
-// Only for a writable Int16 node:
-await adapter.WriteAsync(nodeId, (short)42);
-```
-
-Copy a complete NodeId from an OPC UA client or from `ReadAllAsync()`. Match the C# value type to the node: `(short)42` for Int16, `42` for Int32, `42f` for Float, `true` for Boolean and `"Text"` for String. Check write permissions before writing.
-
-The adapter writes directly through OPC UA. Automatic switching to Manual is a feature of the companion web dashboard, not of the adapter. Cyclic or Scenario simulation can overwrite a directly written value; use Static or Manual for manual tests.
-
-## Monitor value changes
-
-After connecting, subscribe to selected nodes:
+Register the callback before creating the subscription:
 
 ```csharp
-adapter.ValueChanged += (changedNodeId, value) =>
-    Console.WriteLine($"{changedNodeId}: {value.Value}");
-
-await adapter.StartMonitoringAsync(new[] { nodeId }, publishingInterval: 1000);
-Console.ReadLine(); // Keep the console application running
+adapter.ValueChanged += (nodeId, value) =>
+    Console.WriteLine($"{nodeId}: {value.Value}");
+await adapter.StartMonitoringAsync(new[] { "ns=3;s=Test.Counter" }, 1000);
 ```
 
-The interval is the requested publishing interval in milliseconds. `StartMonitoringAllAsync(1000)` monitors all browsed variables; start with a small node list for larger systems. The concrete class also provides `ReadManyAsync(...)` and `ReadAllAsync()`.
+Keep the adapter connected while monitoring. Subscription callbacks run on OPC UA worker threads; marshal UI changes to your UI thread and keep callbacks short. RawValues stores the latest values and exposes ValueUpdated. No messages are published through a mediator.
 
-Callbacks run on OPC UA processing threads. Dispatch WPF or WinForms UI changes onto the UI thread. On shutdown, await `Disconnect()` before disposing the adapter. The `using` statement in the first example handles disposal.
+StartMonitoringAllAsync monitors all custom variables. ReadManyAsync reads a chosen list. ConnectionState and StatusChanged expose state transitions. ConnectionLost reports keepalive failures. There is no automatic retry/fallback service: your application decides when to call ConnectAsync again. Existing monitored node IDs are recreated on reconnect. ConnectionRestored fires after a successful connection.
 
-## Cache and connection state
+## Security and lifecycle
 
-`adapter.RawValues` exposes `RawValueCache`, keyed by server name and NodeId. `GetValues()` reads cached values; `ValueUpdated` reports updates. Reading the cache does not perform a new server read.
+UseSecurity=true selects a secure endpoint. UserName and Password can be set when the target server supports user authentication. The companion server supports anonymous access only.
 
-`OpcUaRawValue` includes the NodeId, value, data type, source/server timestamps, status code and `IsGood`. Check the status before relying on a value.
+AcceptUntrustedCertificates defaults to false. For encrypted connections, configure mutual certificate trust rather than assuming that connecting to a server makes it trusted. Client stores live under %LOCALAPPDATA%/OpcUaAdapter/pki/net<version>, with own, trusted, issuers and rejected subfolders. A caller may provide an ApplicationConfiguration for its own security settings.
 
-`StatusChanged`, `ConnectionLost` and `ConnectionRestored` report connection changes. `ConnectionState` and `IsConnected` expose the current status. The direct class alone does not provide the session manager's complete reconnect orchestration.
+Await Disconnect in a finally block and then dispose the adapter. Do not block subscription callbacks with synchronous reconnect or shutdown calls; schedule lifecycle operations in your application. Dispose is synchronous.
 
-## Manage multiple servers
+## Validation
 
-Test a direct connection first. Use `OpcUaSessionManager` when you need configuration-driven connections, retry handling, monitoring and reconnect management for multiple servers.
-
-1. Create one `OpcUaAdapterConfiguration` per server.
-2. Set `Name` and `EndpointUrl`; optionally set `FallbackEndpointUrl`.
-3. Set `ConnectionOptions.GetAll=false` and provide `NodeIds` for a selected node list. With `true`, all browsed variables are read and monitored.
-4. Provide a shared `RawValueCache`, `ILoggerFactory`, `ILogger<OpcUaSessionManager>` and a MassTransit `IMediator`.
-5. Await `Start(cancellationToken)` and await `Stop()` during shutdown.
-
-The manager constructor accepts configurations as `IEnumerable<OpcUaAdapterConfiguration>`. In an application using dependency injection, register logging, the local mediator, configuration instances, cache and manager so that all constructor parameters can be resolved. A direct constructor call can supply the same dependencies explicitly.
-
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| ConnectionAttempts | 5 | Connection attempts |
-| RetryDelay | 1 second | Delay between attempts |
-| InitialReconnectDelay | 1 second | Initial reconnect delay |
-| MaximumReconnectDelay | 30 seconds | Maximum reconnect delay |
-| GetAll | true | All variables instead of the configured list |
-| SubscriptionIntervalMilliseconds | 1000 | Requested publishing interval |
-
-The manager publishes `OpcUaSessionEstablished`, `OpcUaRawValueChanged` and `OpcUaConnectionChanged` through the mediator. Add consumers if your application needs to handle those messages.
-
-## Authentication and certificates
-
-Set `UserName` and `Password` on the direct adapter if the server supports username authentication. With no username, it connects anonymously. The companion TestServer currently uses anonymous access; username/password authentication is not configured.
-
-The adapter's default configuration stores certificates beside the executable under `OpcUA_Server/AdapterPki`, with `own`, `trusted`, `issuers` and `rejected` directories. Assign a custom OPC UA `ApplicationConfiguration` to `adapter.Configuration` before connecting if needed.
-
-The direct class defaults `AcceptUntrustedCertificates` to `false`. The included session manager currently sets it to `true`, accepting unknown peer certificates; this does not bypass all certificate validation errors. Before use outside local tests, adjust that manager setting and establish the intended certificate trust explicitly.
-
-## Troubleshooting
-
-| Symptom | Check |
-| --- | --- |
-| Adapter types cannot be found | Copy the source folder into the project and check compile inclusion |
-| Missing IMediator or logging types | Install and restore the required NuGet packages |
-| Connection fails | Check the OPC UA address, path, port and running server; compare with another OPC UA client |
-| BadCertificateUntrusted | Check both peers' trust stores; the simulator may regenerate its server certificate on restart |
-| BadUserAccessDenied | Check server authentication support and node permissions |
-| BadNodeIdUnknown | Use the complete NodeId from the connected server |
-| No value-change events | Confirm monitoring started, the application remains running and values actually change |
-| A written value changes back | Check simulation modes and other writing clients |
-
-The adapter remains independent of the companion server. Validate its behavior in your target application and against your actual OPC UA server before depending on it.
+Direct tests against the raw server passed on .NET 8, 9 and 10: connection state, browsing four nodes, typed reads/writes, rejected invalid writes, subscription notifications, raw cache updates, disconnect and reconnect. The server tests also covered occupied preferred ports and concurrent versions. Encrypted/authenticated remote connections and GUI applications were not exercised by these tests.
